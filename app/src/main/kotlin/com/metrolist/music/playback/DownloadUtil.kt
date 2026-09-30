@@ -5,8 +5,14 @@
 
 package com.metrolist.music.playback
 
+import android.content.ContentValues
 import android.content.Context
+import android.media.MediaScannerConnection
 import android.net.ConnectivityManager
+import android.os.Build
+import android.os.Environment
+import android.provider.MediaStore
+import java.io.File
 import androidx.core.content.getSystemService
 import androidx.core.net.toUri
 import androidx.media3.database.DatabaseProvider
@@ -48,6 +54,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -253,11 +260,12 @@ constructor(
                             }
                         }
 
-                        scope.launch {
+                        scope.launch(Dispatchers.IO) {
                             when (download.state) {
                                 Download.STATE_COMPLETED -> {
                                     removeFromPlayerCache(download.request.id)
                                     database.updateDownloadedInfo(download.request.id, true, LocalDateTime.now())
+                                    exportSongToMediaStore(context, download.request.id, downloadCache, database)
                                 }
                                 Download.STATE_FAILED,
                                 Download.STATE_STOPPED,
@@ -444,3 +452,88 @@ internal fun downloadContentLength(
 
 private val PARTIAL_CONTENT_RANGE = Regex("""bytes\s+0-0/(\d+)""", RegexOption.IGNORE_CASE)
 private val UNSATISFIED_CONTENT_RANGE = Regex("""bytes\s+\*/(\d+)""", RegexOption.IGNORE_CASE)
+
+fun exportSongToMediaStore(
+    context: Context,
+    mediaId: String,
+    downloadCache: Cache,
+    database: MusicDatabase,
+) {
+    runCatching {
+        val songWithStats = database.getSongByIdBlocking(mediaId) ?: return
+        val song = songWithStats.song
+        val format = runBlocking(Dispatchers.IO) { database.format(mediaId).first() }
+
+        val mimeType = format?.mimeType?.takeIf { it.isNotBlank() } ?: "audio/mp4"
+        val extension = when {
+            mimeType.contains("webm") || mimeType.contains("opus") -> "opus"
+            mimeType.contains("mpeg") || mimeType.contains("mp3") -> "mp3"
+            mimeType.contains("aac") -> "aac"
+            mimeType.contains("flac") -> "flac"
+            mimeType.contains("ogg") -> "ogg"
+            else -> "m4a"
+        }
+
+        val artistName = songWithStats.artists.joinToString(", ") { it.name }.ifBlank { "Unknown Artist" }
+        val safeTitle = sanitizeFilename(song.title)
+        val safeArtist = sanitizeFilename(artistName)
+        val fileName = "$safeTitle - $safeArtist.$extension"
+
+        val spans = downloadCache.getCachedSpans(mediaId).sortedBy { it.position }
+        if (spans.isEmpty()) return
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val contentValues = ContentValues().apply {
+                put(MediaStore.Audio.Media.DISPLAY_NAME, fileName)
+                put(MediaStore.Audio.Media.TITLE, song.title)
+                put(MediaStore.Audio.Media.ARTIST, artistName)
+                song.albumName?.let { put(MediaStore.Audio.Media.ALBUM, it) }
+                put(MediaStore.Audio.Media.MIME_TYPE, mimeType)
+                put(MediaStore.Audio.Media.RELATIVE_PATH, Environment.DIRECTORY_MUSIC + "/Metrolist")
+                put(MediaStore.Audio.Media.IS_PENDING, 1)
+            }
+
+            val resolver = context.contentResolver
+            val uri = resolver.insert(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, contentValues) ?: return
+
+            runCatching {
+                resolver.openOutputStream(uri)?.use { outputStream ->
+                    spans.forEach { span ->
+                        span.file?.let { file ->
+                            if (file.exists()) {
+                                file.inputStream().use { input -> input.copyTo(outputStream) }
+                            }
+                        }
+                    }
+                }
+                val updateValues = ContentValues().apply {
+                    put(MediaStore.Audio.Media.IS_PENDING, 0)
+                }
+                resolver.update(uri, updateValues, null, null)
+            }.onFailure {
+                resolver.delete(uri, null, null)
+            }
+        } else {
+            val musicDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC), "Metrolist")
+            if (!musicDir.exists()) musicDir.mkdirs()
+            val destFile = File(musicDir, fileName)
+
+            destFile.outputStream().use { outputStream ->
+                spans.forEach { span ->
+                    span.file?.let { file ->
+                        if (file.exists()) {
+                            file.inputStream().use { input -> input.copyTo(outputStream) }
+                        }
+                    }
+                }
+            }
+            MediaScannerConnection.scanFile(context, arrayOf(destFile.absolutePath), arrayOf(mimeType), null)
+        }
+    }.onFailure {
+        Timber.tag("DownloadUtil").w(it, "Failed to export downloaded song $mediaId to MediaStore")
+    }
+}
+
+fun sanitizeFilename(name: String): String {
+    return name.replace(Regex("""[\\/:*?"<>|]"""), "_").trim()
+}
