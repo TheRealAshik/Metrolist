@@ -6,7 +6,10 @@
 package com.metrolist.music.playback
 
 import android.content.Context
+import android.media.MediaScannerConnection
 import android.net.ConnectivityManager
+import android.os.Environment
+import java.io.File
 import androidx.core.content.getSystemService
 import androidx.core.net.toUri
 import androidx.media3.database.DatabaseProvider
@@ -258,6 +261,7 @@ constructor(
                                 Download.STATE_COMPLETED -> {
                                     removeFromPlayerCache(download.request.id)
                                     database.updateDownloadedInfo(download.request.id, true, LocalDateTime.now())
+                                    scanDownloadedFiles(context, getDownloadDir(context))
                                 }
                                 Download.STATE_FAILED,
                                 Download.STATE_STOPPED,
@@ -295,6 +299,10 @@ constructor(
         }
 
     init {
+        val downloadDir = getDownloadDir(context)
+        scope.launch(Dispatchers.IO) {
+            migrateLegacyDownloads(context, downloadDir)
+        }
         val result = mutableMapOf<String, Download>()
         downloadManager.downloadIndex.getDownloads().use { cursor ->
             while (cursor.moveToNext()) {
@@ -444,3 +452,105 @@ internal fun downloadContentLength(
 
 private val PARTIAL_CONTENT_RANGE = Regex("""bytes\s+0-0/(\d+)""", RegexOption.IGNORE_CASE)
 private val UNSATISFIED_CONTENT_RANGE = Regex("""bytes\s+\*/(\d+)""", RegexOption.IGNORE_CASE)
+
+fun getDownloadDir(context: Context): File {
+    val publicMusicDir = runCatching {
+        Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC)?.let { File(it, "Metrolist") }
+    }.getOrNull()
+
+    if (publicMusicDir != null) {
+        val writable = try {
+            if (!publicMusicDir.exists()) {
+                publicMusicDir.mkdirs()
+            }
+            publicMusicDir.exists() && publicMusicDir.canWrite()
+        } catch (_: Exception) {
+            false
+        }
+        if (writable) {
+            return publicMusicDir
+        }
+    }
+
+    val publicDownloadDir = runCatching {
+        Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)?.let { File(it, "Metrolist") }
+    }.getOrNull()
+
+    if (publicDownloadDir != null) {
+        val writable = try {
+            if (!publicDownloadDir.exists()) {
+                publicDownloadDir.mkdirs()
+            }
+            publicDownloadDir.exists() && publicDownloadDir.canWrite()
+        } catch (_: Exception) {
+            false
+        }
+        if (writable) {
+            return publicDownloadDir
+        }
+    }
+
+    val externalMusicDir = context.getExternalFilesDir(Environment.DIRECTORY_MUSIC)?.resolve("Metrolist")
+    if (externalMusicDir != null) {
+        try {
+            if (!externalMusicDir.exists()) externalMusicDir.mkdirs()
+            if (externalMusicDir.exists()) return externalMusicDir
+        } catch (_: Exception) {}
+    }
+
+    val externalDownloadDir = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)?.resolve("Metrolist")
+    if (externalDownloadDir != null) {
+        try {
+            if (!externalDownloadDir.exists()) externalDownloadDir.mkdirs()
+            if (externalDownloadDir.exists()) return externalDownloadDir
+        } catch (_: Exception) {}
+    }
+
+    return context.filesDir.resolve("download")
+}
+
+fun migrateLegacyDownloads(context: Context, newDir: File) {
+    val oldDir = context.filesDir.resolve("download")
+    if (!oldDir.exists()) return
+    runCatching {
+        if (oldDir.canonicalPath == newDir.canonicalPath) return
+        if (!newDir.exists()) {
+            newDir.mkdirs()
+        }
+        oldDir.walkBottomUp().forEach { file ->
+            if (file != oldDir) {
+                val relativePath = file.relativeTo(oldDir).path
+                val target = File(newDir, relativePath)
+                if (file.isDirectory) {
+                    if (!target.exists()) {
+                        target.mkdirs()
+                    }
+                } else {
+                    target.parentFile?.mkdirs()
+                    file.copyTo(target, overwrite = true)
+                    file.delete()
+                }
+            }
+        }
+        oldDir.deleteRecursively()
+    }.onFailure {
+        Timber.tag("DownloadUtil").w(it, "Failed to migrate legacy downloads from $oldDir to $newDir")
+    }
+}
+
+fun scanDownloadedFiles(context: Context, downloadDir: File) {
+    runCatching {
+        if (downloadDir.exists()) {
+            val filesToScan = downloadDir.walkTopDown()
+                .filter { it.isFile }
+                .map { it.absolutePath }
+                .toList()
+                .toTypedArray()
+            if (filesToScan.isNotEmpty()) {
+                MediaScannerConnection.scanFile(context, filesToScan, null, null)
+            }
+        }
+    }.onFailure {
+        Timber.tag("DownloadUtil").w(it, "Failed to scan downloaded files in $downloadDir")
+    }
+}
