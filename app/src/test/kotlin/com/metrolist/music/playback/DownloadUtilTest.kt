@@ -35,32 +35,9 @@ class DownloadUtilTest {
     }
 
     @Test
-    fun `getDownloadDir returns non-null directory`() {
-        val context = RuntimeEnvironment.getApplication()
-        val dir = getDownloadDir(context)
-        assertNotNull(dir)
-        assertTrue(dir.path.contains("Metrolist") || dir.path.contains("download"))
-    }
-
-    @Test
-    fun `migrateLegacyDownloads moves files from old location to new location`() {
-        val context = RuntimeEnvironment.getApplication()
-        val tempFolder = Files.createTempDirectory("download_test").toFile()
-        try {
-            val oldDir = context.filesDir.resolve("download")
-            oldDir.mkdirs()
-            val dummyFile = File(oldDir, "test_file.exo")
-            dummyFile.writeText("test data")
-
-            val newDir = File(tempFolder, "Metrolist")
-            migrateLegacyDownloads(context, newDir)
-
-            assertFalse(oldDir.exists())
-            val migratedFile = File(newDir, "test_file.exo")
-            assertTrue(migratedFile.exists())
-            assertEquals("test data", migratedFile.readText())
-        } finally {
-            tempFolder.deleteRecursively()
-        }
+    fun `sanitizeFilename removes invalid characters`() {
+        assertEquals("Song_Title_Artist", sanitizeFilename("Song:Title/Artist"))
+        assertEquals("Clean Title", sanitizeFilename("Clean Title"))
+        assertEquals("Title_Name_", sanitizeFilename("Title*Name?"))
     }
 }

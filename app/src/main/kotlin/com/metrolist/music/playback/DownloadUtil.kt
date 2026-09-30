@@ -5,10 +5,13 @@
 
 package com.metrolist.music.playback
 
+import android.content.ContentValues
 import android.content.Context
 import android.media.MediaScannerConnection
 import android.net.ConnectivityManager
+import android.os.Build
 import android.os.Environment
+import android.provider.MediaStore
 import java.io.File
 import androidx.core.content.getSystemService
 import androidx.core.net.toUri
@@ -51,6 +54,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -256,12 +260,12 @@ constructor(
                             }
                         }
 
-                        scope.launch {
+                        scope.launch(Dispatchers.IO) {
                             when (download.state) {
                                 Download.STATE_COMPLETED -> {
                                     removeFromPlayerCache(download.request.id)
                                     database.updateDownloadedInfo(download.request.id, true, LocalDateTime.now())
-                                    scanDownloadedFiles(context, getDownloadDir(context))
+                                    exportSongToMediaStore(context, download.request.id, downloadCache, database)
                                 }
                                 Download.STATE_FAILED,
                                 Download.STATE_STOPPED,
@@ -299,10 +303,6 @@ constructor(
         }
 
     init {
-        val downloadDir = getDownloadDir(context)
-        scope.launch(Dispatchers.IO) {
-            migrateLegacyDownloads(context, downloadDir)
-        }
         val result = mutableMapOf<String, Download>()
         downloadManager.downloadIndex.getDownloads().use { cursor ->
             while (cursor.moveToNext()) {
@@ -453,104 +453,87 @@ internal fun downloadContentLength(
 private val PARTIAL_CONTENT_RANGE = Regex("""bytes\s+0-0/(\d+)""", RegexOption.IGNORE_CASE)
 private val UNSATISFIED_CONTENT_RANGE = Regex("""bytes\s+\*/(\d+)""", RegexOption.IGNORE_CASE)
 
-fun getDownloadDir(context: Context): File {
-    val publicMusicDir = runCatching {
-        Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC)?.let { File(it, "Metrolist") }
-    }.getOrNull()
-
-    if (publicMusicDir != null) {
-        val writable = try {
-            if (!publicMusicDir.exists()) {
-                publicMusicDir.mkdirs()
-            }
-            publicMusicDir.exists() && publicMusicDir.canWrite()
-        } catch (_: Exception) {
-            false
-        }
-        if (writable) {
-            return publicMusicDir
-        }
-    }
-
-    val publicDownloadDir = runCatching {
-        Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)?.let { File(it, "Metrolist") }
-    }.getOrNull()
-
-    if (publicDownloadDir != null) {
-        val writable = try {
-            if (!publicDownloadDir.exists()) {
-                publicDownloadDir.mkdirs()
-            }
-            publicDownloadDir.exists() && publicDownloadDir.canWrite()
-        } catch (_: Exception) {
-            false
-        }
-        if (writable) {
-            return publicDownloadDir
-        }
-    }
-
-    val externalMusicDir = context.getExternalFilesDir(Environment.DIRECTORY_MUSIC)?.resolve("Metrolist")
-    if (externalMusicDir != null) {
-        try {
-            if (!externalMusicDir.exists()) externalMusicDir.mkdirs()
-            if (externalMusicDir.exists()) return externalMusicDir
-        } catch (_: Exception) {}
-    }
-
-    val externalDownloadDir = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)?.resolve("Metrolist")
-    if (externalDownloadDir != null) {
-        try {
-            if (!externalDownloadDir.exists()) externalDownloadDir.mkdirs()
-            if (externalDownloadDir.exists()) return externalDownloadDir
-        } catch (_: Exception) {}
-    }
-
-    return context.filesDir.resolve("download")
-}
-
-fun migrateLegacyDownloads(context: Context, newDir: File) {
-    val oldDir = context.filesDir.resolve("download")
-    if (!oldDir.exists()) return
+fun exportSongToMediaStore(
+    context: Context,
+    mediaId: String,
+    downloadCache: Cache,
+    database: MusicDatabase,
+) {
     runCatching {
-        if (oldDir.canonicalPath == newDir.canonicalPath) return
-        if (!newDir.exists()) {
-            newDir.mkdirs()
+        val songWithStats = database.getSongByIdBlocking(mediaId) ?: return
+        val song = songWithStats.song
+        val format = runBlocking(Dispatchers.IO) { database.format(mediaId).first() }
+
+        val mimeType = format?.mimeType?.takeIf { it.isNotBlank() } ?: "audio/mp4"
+        val extension = when {
+            mimeType.contains("webm") || mimeType.contains("opus") -> "opus"
+            mimeType.contains("mpeg") || mimeType.contains("mp3") -> "mp3"
+            mimeType.contains("aac") -> "aac"
+            mimeType.contains("flac") -> "flac"
+            mimeType.contains("ogg") -> "ogg"
+            else -> "m4a"
         }
-        oldDir.walkBottomUp().forEach { file ->
-            if (file != oldDir) {
-                val relativePath = file.relativeTo(oldDir).path
-                val target = File(newDir, relativePath)
-                if (file.isDirectory) {
-                    if (!target.exists()) {
-                        target.mkdirs()
+
+        val artistName = songWithStats.artists.joinToString(", ") { it.name }.ifBlank { "Unknown Artist" }
+        val safeTitle = sanitizeFilename(song.title)
+        val safeArtist = sanitizeFilename(artistName)
+        val fileName = "$safeTitle - $safeArtist.$extension"
+
+        val spans = downloadCache.getCachedSpans(mediaId).sortedBy { it.position }
+        if (spans.isEmpty()) return
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val contentValues = ContentValues().apply {
+                put(MediaStore.Audio.Media.DISPLAY_NAME, fileName)
+                put(MediaStore.Audio.Media.TITLE, song.title)
+                put(MediaStore.Audio.Media.ARTIST, artistName)
+                song.albumName?.let { put(MediaStore.Audio.Media.ALBUM, it) }
+                put(MediaStore.Audio.Media.MIME_TYPE, mimeType)
+                put(MediaStore.Audio.Media.RELATIVE_PATH, Environment.DIRECTORY_MUSIC + "/Metrolist")
+                put(MediaStore.Audio.Media.IS_PENDING, 1)
+            }
+
+            val resolver = context.contentResolver
+            val uri = resolver.insert(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, contentValues) ?: return
+
+            runCatching {
+                resolver.openOutputStream(uri)?.use { outputStream ->
+                    spans.forEach { span ->
+                        span.file?.let { file ->
+                            if (file.exists()) {
+                                file.inputStream().use { input -> input.copyTo(outputStream) }
+                            }
+                        }
                     }
-                } else {
-                    target.parentFile?.mkdirs()
-                    file.copyTo(target, overwrite = true)
-                    file.delete()
+                }
+                val updateValues = ContentValues().apply {
+                    put(MediaStore.Audio.Media.IS_PENDING, 0)
+                }
+                resolver.update(uri, updateValues, null, null)
+            }.onFailure {
+                resolver.delete(uri, null, null)
+            }
+        } else {
+            val musicDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC), "Metrolist")
+            if (!musicDir.exists()) musicDir.mkdirs()
+            val destFile = File(musicDir, fileName)
+
+            destFile.outputStream().use { outputStream ->
+                spans.forEach { span ->
+                    span.file?.let { file ->
+                        if (file.exists()) {
+                            file.inputStream().use { input -> input.copyTo(outputStream) }
+                        }
+                    }
                 }
             }
+            MediaScannerConnection.scanFile(context, arrayOf(destFile.absolutePath), arrayOf(mimeType), null)
         }
-        oldDir.deleteRecursively()
     }.onFailure {
-        Timber.tag("DownloadUtil").w(it, "Failed to migrate legacy downloads from $oldDir to $newDir")
+        Timber.tag("DownloadUtil").w(it, "Failed to export downloaded song $mediaId to MediaStore")
     }
 }
 
-fun scanDownloadedFiles(context: Context, downloadDir: File) {
-    runCatching {
-        if (downloadDir.exists()) {
-            val filesToScan = downloadDir.walkTopDown()
-                .filter { it.isFile }
-                .map { it.absolutePath }
-                .toList()
-                .toTypedArray()
-            if (filesToScan.isNotEmpty()) {
-                MediaScannerConnection.scanFile(context, filesToScan, null, null)
-            }
-        }
-    }.onFailure {
-        Timber.tag("DownloadUtil").w(it, "Failed to scan downloaded files in $downloadDir")
-    }
+fun sanitizeFilename(name: String): String {
+    return name.replace(Regex("""[\\/:*?"<>|]"""), "_").trim()
 }

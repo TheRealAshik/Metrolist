@@ -17,8 +17,6 @@ import com.metrolist.music.db.InternalDatabase
 import com.metrolist.music.db.MusicDatabase
 import com.metrolist.music.listentogether.ListenTogetherClient
 import com.metrolist.music.listentogether.ListenTogetherManager
-import com.metrolist.music.playback.getDownloadDir
-import com.metrolist.music.playback.migrateLegacyDownloads
 import com.metrolist.music.utils.dataStore
 import com.metrolist.music.utils.get
 import dagger.Module
@@ -91,13 +89,11 @@ object AppModule {
     fun provideDownloadCache(
         @ApplicationContext context: Context,
         databaseProvider: DatabaseProvider,
-    ): Cache {
-        return SimpleCache(
-            getDownloadDir(context),
-            NoOpCacheEvictor(),
-            databaseProvider,
-        )
-    }
+    ): Cache = SimpleCache(
+        context.filesDir.resolve("download"),
+        NoOpCacheEvictor(),
+        databaseProvider,
+    )
 
     @Singleton
     @Provides
