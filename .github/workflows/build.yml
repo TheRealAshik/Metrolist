@@ -27,7 +27,7 @@ jobs:
   build_release:
     name: Build Release (${{ matrix.variant }})
     if: github.actor != 'dependabot[bot]' && github.actor != 'renovate[bot]'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
 
     strategy:
@@ -84,12 +84,17 @@ jobs:
         run: |
           OUTPUT_DIR="app/build/outputs/apk/${{ matrix.variant }}/release"
           mkdir -p "$OUTPUT_DIR/out"
+
           if [ "${{ matrix.variant }}" = "gms" ]; then
             TARGET_NAME="app-universal-with-Google-Cast.apk"
           else
             TARGET_NAME="app-universal-release.apk"
           fi
-          find "$OUTPUT_DIR" -name "*-signed.apk" -o -name "*-unsigned-signed.apk" | xargs -I{} mv {} "$OUTPUT_DIR/out/$TARGET_NAME"
+
+          find "$OUTPUT_DIR" \
+            -name "*-signed.apk" \
+            -o -name "*-unsigned-signed.apk" |
+            xargs -I{} mv {} "$OUTPUT_DIR/out/$TARGET_NAME"
 
       - name: Upload Signed APK
         uses: actions/upload-artifact@v7
@@ -100,7 +105,7 @@ jobs:
   build_debug:
     name: Build Debug (${{ matrix.variant }})
     if: github.actor != 'dependabot[bot]' && github.actor != 'renovate[bot]'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
 
     strategy:
@@ -159,7 +164,7 @@ jobs:
     name: Publish Nightly Release
     if: github.event_name == 'push'
     needs: [build_release, build_debug]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
 
     steps:
@@ -177,11 +182,14 @@ jobs:
           mv nightly/app-universal-with-Google-Cast.apk nightly/Metrolist-with-Google-Cast.apk
 
           PREVIOUS_NIGHTLY_SHA=$(gh release view nightly --json targetCommitish --jq .targetCommitish 2>/dev/null || true)
+
           {
             echo "Automated prerelease built from main at commit $GITHUB_SHA. It may be unstable."
+
             if [ -n "$PREVIOUS_NIGHTLY_SHA" ] && [ "$PREVIOUS_NIGHTLY_SHA" != "$GITHUB_SHA" ]; then
               echo
               echo "## Changes since previous nightly"
+
               gh api "repos/$GITHUB_REPOSITORY/compare/$PREVIOUS_NIGHTLY_SHA...$GITHUB_SHA" \
                 --jq '.commits[] | "* \(.commit.message | split("\n")[0]) (\(.sha[0:7]))"'
             fi
